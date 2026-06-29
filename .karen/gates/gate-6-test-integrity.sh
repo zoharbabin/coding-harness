@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$1"
 cd "$ROOT"
 ISSUES=0
+# karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 COVERAGE_FILE="/tmp/karen-self-coverage-$$.out"
 
 if [ ! -f go.mod ]; then

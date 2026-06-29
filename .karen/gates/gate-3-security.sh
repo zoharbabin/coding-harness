@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$1"
 cd "$ROOT"
 ISSUES=0
+# karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi

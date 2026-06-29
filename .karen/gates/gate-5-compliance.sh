@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$1"
 cd "$ROOT"
 ISSUES=0
+# karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 
 # SECURITY.md: accept at root or any first-level subdirectory (monorepo: sdk/SECURITY.md etc.)
 SECURITY_FOUND=$(find . -maxdepth 2 -name "SECURITY.md" -not -path "./.git/*" 2>/dev/null | head -1)

@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$1"
 cd "$ROOT"
 ISSUES=0
+# karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 ZT=0
 
 # Check for agent context file (CLAUDE.md, AGENTS.md, or .cursorrules).
@@ -90,7 +91,7 @@ fi
 # Source-level scan: find Go files that import known LLM packages, then flag unsafe concatenation.
 LLM_IMPORT_FILES=()
 while IFS= read -r f; do LLM_IMPORT_FILES+=("$f"); done < <(grep -rlE '"github\.com/anthropics|github\.com/sashabaranov/go-openai|openai|anthropic' --include="*.go" . 2>/dev/null | grep -v '\.git/')
-for f in "${LLM_IMPORT_FILES[@]}"; do
+for f in "${LLM_IMPORT_FILES[@]+"${LLM_IMPORT_FILES[@]}"}"; do
   while IFS=: read -r file line rest; do
     # Skip lines with a karen-ignore comment.
     if echo "$rest" | grep -q 'karen-ignore'; then continue; fi

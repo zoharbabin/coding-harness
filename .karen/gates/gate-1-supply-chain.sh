@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$1"
 cd "$ROOT"
 ISSUES=0
+# karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 
 # go.sum is required only when the module has external dependencies.
 if [ -f go.mod ] && grep -qE '^require' go.mod 2>/dev/null && [ ! -f go.sum ]; then
