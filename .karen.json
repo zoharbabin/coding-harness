@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "project": {
+    "type": "cli",
+    "language": [
+      "go"
+    ],
+    "deployment": [
+      "cli"
+    ],
+    "audience": "developer",
+    "aiPowered": true
+  },
+  "compliance": [],
+  "coverage": {
+    "threshold": 80
+  },
+  "circuitBreaker": {
+    "threshold": 3,
+    "exitCode": 2
+  }
+}

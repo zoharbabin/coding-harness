@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "karen audit --format compact"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'out=$(karen audit 2>&1); rc=$?; printf \"%s\\n\" \"$out\" >&2; [ $rc -ne 0 ] && printf \"{\\\"decision\\\":\\\"block\\\",\\\"reason\\\":\\\"Karen has complaints — run: karen audit\\\"}\"; exit $rc'"
+          }
+        ]
+      }
+    ]
+  }
+}
