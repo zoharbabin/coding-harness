@@ -39,12 +39,41 @@ if [ "$RELEASES_MANAGED" = "true" ]; then
   : # CHANGELOG.md check suppressed — releasesManaged is true in .karen.json
 else
   CHANGELOG_FOUND=$(find . -maxdepth 2 -name "CHANGELOG.md" -not -path "./.git/*" -not -path "./vendor/*" -not -path "./node_modules/*" 2>/dev/null | head -1)
-  if [ -z "$CHANGELOG_FOUND" ]; then
-    printf 'CHANGELOG.md:0\tmissing compliance artifact — create CHANGELOG.md or set "releasesManaged": true in .karen.json\n'
-    ISSUES=$((ISSUES+1))
-  elif ! grep -qE '^## \[' "$CHANGELOG_FOUND" 2>/dev/null; then
-    printf 'CHANGELOG.md:0\tdoes not follow Keep a Changelog format (missing ## [version] headers)\n'
-    ISSUES=$((ISSUES+1))
+  if [ -n "$CHANGELOG_FOUND" ]; then
+    # CHANGELOG exists — verify it follows Keep a Changelog format.
+    if ! grep -qE '^## \[' "$CHANGELOG_FOUND" 2>/dev/null; then
+      printf 'CHANGELOG.md:0\tdoes not follow Keep a Changelog format (missing ## [version] headers)\n'
+      ISSUES=$((ISSUES+1))
+    fi
+  else
+    # No CHANGELOG.md — check if GitHub Releases serve as the changelog (valid substitute).
+    GH_RELEASES_OK=0
+    if command -v gh &>/dev/null; then
+      # Get the latest release tag, then inspect its body for non-trivial notes.
+      if command -v jq &>/dev/null; then
+        _latest_tag=$(gh release list --limit 1 --json tagName 2>/dev/null \
+          | jq -r '.[0].tagName // ""' 2>/dev/null || true)
+      else
+        _latest_tag=$(gh release list --limit 1 2>/dev/null | awk 'NR==1{print $1}' || true)
+      fi
+      if [ -n "$_latest_tag" ]; then
+        _gh_json=$(gh release view "$_latest_tag" --json body 2>/dev/null || true)
+        if command -v jq &>/dev/null; then
+          _gh_body=$(echo "$_gh_json" | jq -r '.body // ""' 2>/dev/null || true)
+        else
+          _gh_body=$(echo "$_gh_json" | grep -o '"body":"[^"]*"' \
+            | sed 's/"body":"//;s/"$//' 2>/dev/null || true)
+        fi
+        _gh_body_stripped=$(echo "$_gh_body" | tr -d '[:space:]')
+        [ "${#_gh_body_stripped}" -gt 20 ] && GH_RELEASES_OK=1
+      fi
+    fi
+    if [ "$GH_RELEASES_OK" -eq 1 ]; then
+      printf 'WARN:CHANGELOG.md:0\tno CHANGELOG.md — GitHub Releases with release notes detected (acceptable substitute); consider adding CHANGELOG.md for offline discoverability\n'
+    else
+      printf 'CHANGELOG.md:0\tno changelog — create CHANGELOG.md, publish GitHub Releases with release notes, or set "releasesManaged": true in .karen.json\n'
+      ISSUES=$((ISSUES+1))
+    fi
   fi
 fi
 

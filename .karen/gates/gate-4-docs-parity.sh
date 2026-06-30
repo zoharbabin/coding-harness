@@ -212,21 +212,64 @@ done < <(find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*'
   | sort -u || true)
 
 # --- CHECK 4: CHANGELOG gaps ---
-# If git is available, detect commits since last release tag not reflected in CHANGELOG.
+# Three-step flow:
+#   1. CHANGELOG.md exists → verify it is updated since last release tag.
+#   2. No CHANGELOG.md → check if GitHub Releases have substantive notes (valid substitute).
+#   3. Neither → flag as a gap.
 if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
   last_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
-  if [ -n "$last_tag" ] && [ ! -f CHANGELOG.md ]; then
-    printf 'CHANGELOG.md:0\tgit tag "%s" exists but CHANGELOG.md is absent — document changes per release\n' "$last_tag"
-    ISSUES=$((ISSUES+1))
-  elif [ -n "$last_tag" ] && [ -f CHANGELOG.md ]; then
-    commit_count=$(git log "${last_tag}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$commit_count" -gt 0 ]; then
-      # Check if CHANGELOG.md was updated in any commit since the last tag.
-      if [ -z "$(git log "${last_tag}..HEAD" --oneline -- CHANGELOG.md 2>/dev/null)" ]; then
-        printf 'CHANGELOG.md:0\t%s unreleased commit(s) since tag "%s" not reflected in CHANGELOG.md\n' \
-          "$commit_count" "$last_tag"
-        ISSUES=$((ISSUES+1))
+  CHANGELOG_FOUND_4=$(find . -maxdepth 2 -name "CHANGELOG.md" -not -path "./.git/*" -not -path "./vendor/*" -not -path "./node_modules/*" 2>/dev/null | head -1)
+
+  if [ -n "$CHANGELOG_FOUND_4" ]; then
+    # Step 1: CHANGELOG.md exists — check for unreleased commits not yet documented.
+    if [ -n "$last_tag" ]; then
+      commit_count=$(git log "${last_tag}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$commit_count" -gt 0 ]; then
+        if [ -z "$(git log "${last_tag}..HEAD" --oneline -- CHANGELOG.md 2>/dev/null)" ]; then
+          printf 'CHANGELOG.md:0\t%s unreleased commit(s) since tag "%s" not reflected in CHANGELOG.md\n' \
+            "$commit_count" "$last_tag"
+          ISSUES=$((ISSUES+1))
+        fi
       fi
+    fi
+  elif [ -n "$last_tag" ]; then
+    # No CHANGELOG.md but a release tag exists — step 2: check GitHub Releases.
+    GH_RELEASES_FRESH=0
+    if command -v gh &>/dev/null; then
+      # Verify the most recent GH release corresponds to the most recent git tag and has notes.
+      if command -v jq &>/dev/null; then
+        _latest_gh_tag=$(gh release list --limit 1 --json tagName 2>/dev/null \
+          | jq -r '.[0].tagName // ""' 2>/dev/null || true)
+      else
+        _latest_gh_tag=$(gh release list --limit 1 2>/dev/null | awk 'NR==1{print $1}' || true)
+      fi
+      if [ -n "$_latest_gh_tag" ]; then
+        _gh_json=$(gh release view "$_latest_gh_tag" --json body 2>/dev/null || true)
+        if command -v jq &>/dev/null; then
+          _gh_body=$(echo "$_gh_json" | jq -r '.body // ""' 2>/dev/null || true)
+        else
+          _gh_body=$(echo "$_gh_json" | grep -o '"body":"[^"]*"' \
+            | sed 's/"body":"//;s/"$//' 2>/dev/null || true)
+        fi
+        _gh_stripped=$(echo "$_gh_body" | tr -d '[:space:]')
+        [ "${#_gh_stripped}" -gt 20 ] && GH_RELEASES_FRESH=1
+      fi
+    fi
+
+    if [ "$GH_RELEASES_FRESH" -eq 1 ]; then
+      # Check if commits since last tag are covered: GH release tag should match last git tag.
+      commit_count=$(git log "${last_tag}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$commit_count" -gt 0 ] && [ "$_latest_gh_tag" != "$last_tag" ]; then
+        printf 'CHANGELOG.md:0\t%s unreleased commit(s) since tag "%s" — no CHANGELOG.md and latest GitHub Release is "%s", not "%s"; update release notes\n' \
+          "$commit_count" "$last_tag" "$_latest_gh_tag" "$last_tag"
+        ISSUES=$((ISSUES+1))
+      else
+        printf 'WARN:CHANGELOG.md:0\tno CHANGELOG.md — GitHub Releases with release notes detected (acceptable substitute)\n'
+      fi
+    else
+      # Step 3: neither CHANGELOG.md nor GitHub Releases with notes.
+      printf 'CHANGELOG.md:0\tgit tag "%s" exists but no changelog — create CHANGELOG.md or publish GitHub Releases with release notes\n' "$last_tag"
+      ISSUES=$((ISSUES+1))
     fi
   fi
 fi
