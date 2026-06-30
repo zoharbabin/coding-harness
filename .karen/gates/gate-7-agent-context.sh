@@ -110,13 +110,21 @@ fi
 
 # Check for prompt injection surface.
 # Source-level scan: find Go files that import known LLM packages, then flag unsafe concatenation.
+# G7-FP1 FIX: restrict to structural patterns (variable decl, field assign, param) to avoid
+# matching the word "prompt" inside string literals or error messages.
+# Exclude vendor/, testdata/, and .git/ per BLUEPRINT spec.
 LLM_IMPORT_FILES=()
-while IFS= read -r f; do LLM_IMPORT_FILES+=("$f"); done < <(grep -rlE '"github\.com/anthropics|github\.com/sashabaranov/go-openai|[^"]*openai[^"]*"|[^"]*anthropic[^"]*"' --include="*.go" . 2>/dev/null | grep -v '\.git/' || true)
+while IFS= read -r f; do LLM_IMPORT_FILES+=("$f"); done < <(grep -rlE '"github\.com/anthropics|github\.com/sashabaranov/go-openai|[^"]*openai[^"]*"|[^"]*anthropic[^"]*"' --include="*.go" . 2>/dev/null | grep -v '\.git/' | grep -v '/vendor/' | grep -v '/testdata/' || true)
 for f in "${LLM_IMPORT_FILES[@]+"${LLM_IMPORT_FILES[@]}"}"; do
   while IFS=: read -r file line rest; do
-    printf '%s:%s\tpotential prompt injection — fmt.Sprintf or string concat in LLM client file; verify user input is sanitized before insertion\n' "$f" "$file"
+    printf '%s:%s\tpotential prompt injection — string concat in LLM client file; verify user input is sanitized before insertion\n' "$f" "$file"
     ISSUES=$((ISSUES+1))
-  done < <(grep -nE 'fmt\.Sprintf\(|\b(prompt|systemPrompt|userMessage|instruction|context)\s*[+]?=.*\+' "$f" 2>/dev/null | grep -v 'karen-ignore' | head -5 || true)
+  done < <({ \
+    grep -nE '^[^/]*fmt\.Sprintf\([^)]*[Pp]rompt' "$f" 2>/dev/null; \
+    grep -nE '^[^/]*([a-zA-Z_][a-zA-Z0-9_]*[Pp]rompt[a-zA-Z0-9_]*|[Pp]rompt)[[:space:]]*[+]?=[^=].*\+' "$f" 2>/dev/null; \
+    grep -nE '^[^/]*func[[:space:]]+[a-zA-Z_$]*[[:space:]]*\([^)]*[Pp]rompt[^)]*\)' "$f" 2>/dev/null; \
+    grep -nE '^[^/]*[a-zA-Z_][a-zA-Z0-9_]*\.[Pp]rompt[[:space:]]*=[^=].*\+' "$f" 2>/dev/null; \
+  } | grep -v 'karen-ignore' | head -5 || true)
 done
 
 # Source-level scan: find JS/MJS files that import known LLM packages, then flag unsafe string concat into prompt variables.
@@ -124,8 +132,10 @@ LLM_JS_IMPORT_FILES=()
 while IFS= read -r f; do LLM_JS_IMPORT_FILES+=("$f"); done < <(grep -rlE "(require|from)[[:space:]]*['\"]((openai|@anthropic-ai\/sdk|anthropic|langchain|@langchain))" \
   --include="*.js" --include="*.mjs" --include="*.ts" --include="*.tsx" \
   --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist \
+  --exclude-dir=.next --exclude-dir=build --exclude-dir=coverage \
   . 2>/dev/null || true)
 # Content-based detection for AI SDKs not using openai/anthropic imports (e.g. proprietary/custom wrappers).
+# Exclude files where all matches are in comment lines (// or /* style) to reduce false positives.
 LLM_JS_FILES=()
 while IFS= read -r f; do LLM_JS_FILES+=("$f"); done < <(
   { printf "%s\n" "${LLM_JS_IMPORT_FILES[@]+"${LLM_JS_IMPORT_FILES[@]}"}"; \
@@ -135,15 +145,47 @@ while IFS= read -r f; do LLM_JS_FILES+=("$f"); done < <(
       -e "chat\.completions" -e "generateContent" -e "invokeModel" \
       --include="*.js" --include="*.mjs" --include="*.ts" --include="*.tsx" \
       . 2>/dev/null \
-      | grep -v "/node_modules/" | grep -v "/dist/" | grep -v "/tests/artifacts/" || true; \
-  } | sort -u | grep .
+      | grep -v "/node_modules/" | grep -v "/dist/" | grep -v "/tests/artifacts/" \
+      | grep -v "/\.next/" | grep -v "/build/" | grep -v "/coverage/" || true; \
+  } | sort -u | grep . | while IFS= read -r _cf; do
+      # Only include files that have at least one non-comment match.
+      if grep -E "(systemPrompt|assembleSystemPrompt|buildSystemPrompt|constructPrompt|promptTemplate|buildPrompt|assemblePrompt|chat\.completions|generateContent|invokeModel)" "$_cf" 2>/dev/null \
+         | grep -qvE '^[[:space:]]*(//|/\*)'; then
+        printf '%s\n' "$_cf"
+      fi
+    done
 )
+
+# LLM API call pattern — any of these in a file confirms an actual injection surface.
+_LLM_CALL_PAT='fetch[[:space:]]*\(|axios\.|openai\.|anthropic\.|@anthropic-ai|createCompletion|chatCompletion|generateContent|llm\.call|llm\.invoke|model\.generate'
+
 for f in "${LLM_JS_FILES[@]+"${LLM_JS_FILES[@]}"}"; do
+  # G7-FP2 FIX: if the file contains no actual LLM API call patterns, demote to WARN only.
+  # SDK utility files that assemble prompts without ever calling an LLM are not injection surfaces.
+  if ! grep -qE "$_LLM_CALL_PAT" "$f" 2>/dev/null; then
+    # Check whether there are any structural prompt-variable matches at all before warning.
+    # NOTE: use grep without -q so stdout can be piped to grep -v for karen-ignore filtering.
+    if grep -E \
+      '(const|let|var)[[:space:]]+(prompt|systemPrompt|userMessage|instruction)[[:space:]]*=|[a-zA-Z_][a-zA-Z0-9_]*\.(prompt|systemPrompt)[[:space:]]*=|[[:space:]](prompt|systemPrompt|userMessage|instruction)[[:space:]]*=>|(prompt|systemPrompt|userMessage|instruction)[[:space:]]*\+=' \
+      "$f" 2>/dev/null | grep -qv 'karen-ignore'; then
+      printf '%s:0\tSDK prompt utility without LLM call — verify this is not a user-facing injection surface\n' "$f"
+    fi
+    # No ISSUES increment — WARN only.
+    continue
+  fi
+  # File contains LLM API calls: apply structural prompt-variable detection.
+  # G7-FP1 FIX: match only structural contexts (var decl, template-literal assignment, property assign)
+  # to avoid false positives from the word "prompt" inside string literals or error messages.
   while IFS=: read -r file line rest; do
     printf '%s:%s\tJS LLM: potential prompt injection via string concat — verify user input is sanitized before insertion\n' "$f" "$file"
     ISSUES=$((ISSUES+1))
-  done < <({ grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=]*=[^=].*\+' "$f" 2>/dev/null; \
-             grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=]*=.*`[^`]*\$\{' "$f" 2>/dev/null; } | grep -v 'karen-ignore' | head -5 || true)
+  done < <({ \
+    grep -nE '(const|let|var)[[:space:]]+(prompt|systemPrompt|userMessage|instruction)[[:space:]]*=[^=].*\+' "$f" 2>/dev/null; \
+    grep -nE '(const|let|var)[[:space:]]+(prompt|systemPrompt|userMessage|instruction)[[:space:]]*=.*`[^`]*\$\{' "$f" 2>/dev/null; \
+    grep -nE '\.(prompt|systemPrompt|userMessage|instruction)[[:space:]]*=[^=].*\+' "$f" 2>/dev/null; \
+    grep -nE '\.(prompt|systemPrompt|userMessage|instruction)[[:space:]]*=.*`[^`]*\$\{' "$f" 2>/dev/null; \
+    grep -nE '(prompt|systemPrompt|userMessage|instruction)[[:space:]]*\+=[^=]' "$f" 2>/dev/null; \
+  } | grep -v 'karen-ignore' | head -5 || true)
 done
 
 # Context-file declaration check for prompt injection policy.

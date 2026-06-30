@@ -69,7 +69,7 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E '"[[:space:]]*(SELECT|INSERT|UPDATE|DELETE)[^"]*"[[:space:]]*\+' \
-  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 # Issue 19: os.OpenFile added to alternation.
 while IFS=: read -r file line rest; do
@@ -78,7 +78,7 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E 'os\.(Open|OpenFile|Create|ReadFile|WriteFile)[[:space:]]*\(.*\+|filepath\.Join[[:space:]]*\(.*\+' \
-  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
@@ -86,7 +86,7 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E 'http\.(Get|Post|Do|Head)[[:space:]]*\([[:space:]]*"http://' \
-  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 # Issue 4: bare 'auth' removed from alternation to avoid false positives on auth-flow log lines.
 while IFS=: read -r file line rest; do
@@ -95,7 +95,7 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E '(log\.|fmt\.Print|fmt\.Fprintf|fmt\.Fprintln).*\b(token|password|passwd|secret|api_?key|credential)\b' \
-  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 # Issue 15: pattern split so 'key' match requires it not be a file extension (.key).
 while IFS=: read -r file line rest; do
@@ -104,7 +104,7 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E 'os\.(WriteFile|Create)[[:space:]]*\(.*\b(token|secret|password)\b|os\.(WriteFile|Create)[[:space:]]*\([^"]*\bkey\b' \
-  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 # --- JS SAST ---
 # Run when *.js, *.mjs, *.ts, *.tsx, *.jsx, or *.cjs files exist outside excluded directories.
@@ -211,13 +211,41 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
     printf '%s:%s\tJS eval() call — dynamic code execution; use safer alternatives\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep "\beval[[:space:]]*\(" \
-    | grep -v '\.[a-zA-Z_][a-zA-Z_0-9]*eval[[:space:]]*(' \
+    | grep -v '\.eval[[:space:]]*(' \
     | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' | grep -v '/tests/' | grep -v '/test/' | grep -v '/integration/' || true)
 
   # 5. innerHTML assignment
   # Issue 2: pattern tightened to require = not followed by another = to exclude === and == comparisons.
+  # G3-FP1: skip empty-string clears (innerHTML = "" or innerHTML = '') — zero XSS risk.
+  # G3-FP2: demote to WARN (no ISSUES increment) when a known sanitizer appears in the
+  #         5 lines preceding the assignment in the same file.
+  # G3-FP3: test files excluded (same pattern as checks 2-4).
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
+    # G3-FP1: skip empty-string assignments
+    if printf '%s' "$rest" | grep -qE "innerHTML[[:space:]]*[+]?=[[:space:]]*[\"'][[:space:]]*[\"']"; then
+      continue
+    fi
+    # G3-FP3: skip test files
+    case "$file" in
+      *.test.*|*.spec.*) continue ;;
+    esac
+    case "$file" in
+      */__tests__/*|*/tests/*|*/test/*|*/spec/*) continue ;;
+    esac
+    # G3-FP2: check preceding 5 lines for known sanitizers
+    if [ -f "$file" ] && [ "$line" -gt 0 ] 2>/dev/null; then
+      start_line=$((line - 5))
+      [ "$start_line" -lt 1 ] && start_line=1
+      end_line=$((line - 1))
+      if [ "$end_line" -ge "$start_line" ]; then
+        if sed -n "${start_line},${end_line}p" "$file" 2>/dev/null \
+            | grep -qE 'DOMPurify\.sanitize|escapeHtml|htmlEscape|sanitizeHtml|xss\.escape'; then
+          printf 'WARN:%s:%s\tJS innerHTML assignment — sanitizer detected upstream — verify manually\n' "$file" "$line"
+          continue
+        fi
+      fi
+    fi
     printf '%s:%s\tJS innerHTML assignment — potential XSS; use textContent or sanitize input\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep "\.innerHTML[[:space:]]*[+]?=[^=]")
@@ -255,6 +283,81 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
     printf '%s:%s\tJS postMessage with wildcard targetOrigin ("*") — specify explicit origin to prevent cross-origin data leaks\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep '\.postMessage\([^,)]*,[[:space:]]*["'"'"']\*["'"'"']' || true)
+
+  # 10. JS path traversal — user input flowing into file path operations.
+  # G3-FN1: check JS/TS files for req.query|req.params|req.body|req.headers appearing
+  # in the same statement or within 3 lines of path.join|readFile|readFileSync|
+  # writeFile|writeFileSync|createReadStream.
+  while IFS=: read -r file line rest; do
+    [ -z "$file" ] && continue
+    # skip test files
+    case "$file" in
+      *.test.*|*.spec.*) continue ;;
+    esac
+    case "$file" in
+      */__tests__/*|*/tests/*|*/test/*|*/spec/*) continue ;;
+    esac
+    printf '%s:%s\tJS potential path traversal — user input in file path operation\n' "$file" "$line"
+    JS_ISSUES=$((JS_ISSUES+1))
+  done < <(
+    # Find lines that contain both a path operation AND user-input reference in the same line.
+    js_grep "(path\.join|readFile|readFileSync|writeFile|writeFileSync|createReadStream).*\b(req\.(query|params|body|headers))\b|\b(req\.(query|params|body|headers))\b.*(path\.join|readFile|readFileSync|writeFile|writeFileSync|createReadStream)" \
+      || true
+  )
+  # Also check for proximity: path op within 3 lines of user-input reference.
+  # We do this as a per-file sliding-window scan using awk.
+  while IFS= read -r hit_file; do
+    [ -z "$hit_file" ] && continue
+    # skip test files
+    case "$hit_file" in
+      *.test.*|*.spec.*) continue ;;
+    esac
+    case "$hit_file" in
+      */__tests__/*|*/tests/*|*/test/*|*/spec/*) continue ;;
+    esac
+    awk '
+      /path\.join|readFile|readFileSync|writeFile|writeFileSync|createReadStream/ { path_line = NR }
+      /req\.(query|params|body|headers)/ { req_line = NR }
+      {
+        if (path_line > 0 && req_line > 0) {
+          diff = path_line - req_line
+          if (diff < 0) diff = -diff
+          if (diff <= 3 && diff > 0) {
+            print FILENAME ":" path_line ":proximity"
+            path_line = 0
+            req_line = 0
+          }
+        }
+      }
+    ' "$hit_file" 2>/dev/null
+  done < <(
+    grep -rl --include="*.js" --include="*.mjs" --include="*.ts" --include="*.tsx" --include="*.jsx" --include="*.cjs" \
+      -E 'req\.(query|params|body|headers)' -- "$ROOT" 2>/dev/null \
+      | grep -v '/node_modules/' | grep -v '/\.git/' | grep -v '/dist/' | grep -v '/build/' \
+      | grep -v '/coverage/' | grep -v '/tests/artifacts/' | grep -v '/tests/fixtures/' \
+      | grep -v '/test/fixtures/' | grep -v '/spec/fixtures/' | grep -v '/__snapshots__/' \
+      | grep -v '\.min\.js$' | grep -v 'karen-ignore' \
+      || true
+  ) | sort -u | while IFS=: read -r file line rest; do
+    [ -z "$file" ] && continue
+    case "$file" in
+      *.test.*|*.spec.*) continue ;;
+    esac
+    case "$file" in
+      */__tests__/*|*/tests/*|*/test/*|*/spec/*) continue ;;
+    esac
+    # check the file still matches (awk may emit false proximity matches on single-pattern files)
+    if grep -qE 'path\.join|readFile|readFileSync|writeFile|writeFileSync|createReadStream' "$file" 2>/dev/null \
+        && grep -qE 'req\.(query|params|body|headers)' "$file" 2>/dev/null; then
+      # per-line karen-ignore check: read the specific matched line and skip only if it contains karen-ignore
+      matched_line=$(sed -n "${line}p" "$file" 2>/dev/null || true)
+      if printf '%s' "$matched_line" | grep -q 'karen-ignore'; then
+        continue
+      fi
+      printf '%s:%s\tJS potential path traversal — user input in file path operation\n' "$file" "$line"
+      JS_ISSUES=$((JS_ISSUES+1))
+    fi
+  done
 
   # Cap JS issues at 30 to avoid overwhelming output.
   if [ "$JS_ISSUES" -gt 30 ]; then

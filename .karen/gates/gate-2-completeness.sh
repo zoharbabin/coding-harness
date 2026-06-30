@@ -44,6 +44,7 @@ done < <(grep -rn --include="*.go" --exclude="*_test.go" --exclude-dir=vendor \
   -E '^(func|type) [A-Z]' . 2>/dev/null | grep -v '/.git/' | head -25 || true)
 
 # --- JS/TS: scan when files exist ---
+# G2-FN1: exclude mock/, testdata/ paths (in addition to existing test/node_modules/dist/build/coverage exclusions)
 JS_FILES=()
 while IFS= read -r jsfile; do
   JS_FILES+=("$jsfile")
@@ -53,6 +54,7 @@ done < <(find "$ROOT" -maxdepth 8 -type f \( -name "*.js" -o -name "*.mjs" -o -n
   ! -path "*/tools/*" ! -path "*/scripts/*" ! -path "*/vendor/*" \
   ! -path "*/test/*" ! -path "*/tests/*" ! -path "*/__tests__/*" \
   ! -path "*/examples/*" ! -path "*/example/*" \
+  ! -path "*/mock/*" ! -path "*/testdata/*" \
   ! -name "*.test.js" ! -name "*.spec.js" ! -name "*.test.ts" ! -name "*.spec.ts" \
   ! -name "*.d.ts" ! -name "*.test.tsx" ! -name "*.spec.tsx" ! -name "*.test.mjs" ! -name "*.spec.mjs" \
   2>/dev/null || true)
@@ -88,7 +90,10 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
       ISSUES=$((ISSUES+1))
     done < <(grep -ni 'throw new Error\(['"'"'"`]not implemented' "$jsf" 2>/dev/null || true)
 
-    # ISSUE 5: JS/TS undocumented public exports check
+    # ISSUE 5 / G2-FP1 / G2-FP2: JS/TS undocumented public exports check
+    # G2-FP1: lookback extended to 15 lines; import/require lines are skipped and do NOT
+    #         count against the lookback budget.
+    # G2-FP2: section-divider comments produce WARN (not FAIL).
     while IFS= read -r rawline; do
       [ -z "$rawline" ] && continue
       lineno="${rawline%%:*}"
@@ -97,17 +102,32 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
       if [ "$ISSUES" -ge 75 ]; then break; fi
       linenum_int=$((lineno))
       doc_found=0
+      section_divider=0
       _check=$linenum_int
-      while [ "$((_check - 1))" -ge 1 ] && [ "$((_check - linenum_int))" -gt -5 ]; do
+      _budget=0
+      while [ "$((_check - 1))" -ge 1 ] && [ "$_budget" -lt 15 ]; do
         _check=$((_check - 1))
         _lookback=$(sed -n "${_check}p" "$jsf" 2>/dev/null || true)
-        # skip blank lines
+        # skip blank lines (don't count against budget)
         echo "$_lookback" | grep -qE '^[[:space:]]*$' && continue
-        # first non-blank line: check if it's a doc comment
+        # skip import/require lines — don't count against lookback budget (G2-FP1)
+        echo "$_lookback" | grep -qE '^[[:space:]]*(import |.*require\()' && continue
+        _budget=$((_budget + 1))
+        # G2-FP2: detect section-divider comments
+        # Pattern: // --- text --- or // === text === or pure repetition lines
+        if echo "$_lookback" | grep -qE '^[[:space:]]*//[[:space:]]*([-=─]{2,}|[-=─]+[[:space:]]*[A-Za-z].*[-=─]+[[:space:]]*)$'; then
+          section_divider=1
+          break
+        fi
+        # first non-blank, non-import, non-divider line: check if it's a doc comment
         echo "$_lookback" | grep -qE '^[[:space:]]*(\*|/\*\*|///)' && doc_found=1
         break
       done
-      [ "$doc_found" -eq 1 ] && continue
+      if [ "$doc_found" -eq 1 ]; then continue; fi
+      if [ "$section_divider" -eq 1 ]; then
+        printf 'NOTE:%s:%s\tsection divider found instead of JSDoc --- convert to /** */ for API docs\n' "$relfile" "$lineno"
+        continue
+      fi
       printf '%s:%s\tJS: exported function/class lacks JSDoc comment\n' "$relfile" "$lineno"
       ISSUES=$((ISSUES+1))
     done < <(grep -n 'export[[:space:]]\+\(function\|class\|async function\)' "$jsf" 2>/dev/null || true)
@@ -120,4 +140,4 @@ if [ "$ISSUES" -eq 0 ]; then
 else
   printf 'FAIL (%s issues)\n' "$ISSUES"
 fi
-exit 0
+[ "$ISSUES" -eq 0 ] && exit 0 || exit 1

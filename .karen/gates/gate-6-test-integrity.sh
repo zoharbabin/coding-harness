@@ -57,17 +57,20 @@ if [ -f go.mod ]; then
   done < <(find "$ROOT" -name '*_test.go' -not -path '*/vendor/*' -print0 2>/dev/null)
 
   # Live credential usage: tests must not require real credentials to pass
+  # Check each matching line individually so a t.Skip near one match cannot
+  # clear a second match with no nearby t.Skip (false-negative guard).
   while IFS= read -r -d '' f; do
     rel="${f#$ROOT/}"
-    if grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | \
-       cut -d: -f2- | grep -qvE '^[[:space:]]*(//|t\.Skip|.*karen-ignore)'; then
-      # Also check if t.Skip appears within 3 lines after each match
-      if ! grep -A3 -E 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | grep -qE 't\.Skip|karen-ignore'; then
-        lineno=$(grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | head -1 | cut -d: -f1)
-        printf '%s:%s\tlive credential read in test — add t.Skip when credential is absent\n' "$rel" "$lineno"
-        ISSUES=$((ISSUES+1))
-      fi
-    fi
+    while IFS=: read -r lineno rest; do
+      [ -z "$lineno" ] && continue
+      # Suppress if the line itself is commented, is a t.Skip, or carries karen-ignore.
+      if echo "$rest" | grep -qE '^[[:space:]]*(//|t\.Skip|.*karen-ignore)'; then continue; fi
+      # Check if t.Skip or karen-ignore appears within 3 lines after this match.
+      skip_nearby=$(awk "NR>=$lineno && NR<=$((lineno+3)){print}" "$f" | grep -cE 't\.Skip|karen-ignore' || true)
+      if [ "${skip_nearby:-0}" -gt 0 ]; then continue; fi
+      printf '%s:%s\tlive credential read in test — add t.Skip when credential is absent\n' "$rel" "$lineno"
+      ISSUES=$((ISSUES+1))
+    done < <(grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" 2>/dev/null || true)
   done < <(find "$ROOT" -name '*_test.go' -not -path '*/vendor/*' -print0 2>/dev/null)
 
   SUMMARY_EMITTED=1
@@ -111,6 +114,11 @@ if command -v c8 >/dev/null 2>&1; then
   # c8 runs tests with V8 coverage in a single pass.
   # If the project uses jest, vitest, mocha, or jasmine, wrap npm test instead of node --test.
   TEST_SCRIPT=$(jq -r '.scripts.test // empty' package.json 2>/dev/null)
+  # G6-FN1: detect single-quoted globs in node --test scripts (shell passes literal
+  # quote chars to node, which finds zero files and exits 0 with vacuous 100% coverage).
+  if echo "$TEST_SCRIPT" | grep -qE "node[[:space:]].*--test.*'[^']*[*][^']*'"; then
+    printf 'WARN:package.json:0\tglob quoting may prevent test discovery — use double-quoted or unquoted globs for node --test file patterns\n'
+  fi
   set +e
   if echo "$TEST_SCRIPT" | grep -qE 'jest|vitest|mocha|jasmine'; then
     c8 --check-coverage --lines "$THRESHOLD" --functions "$THRESHOLD" --branches "$THRESHOLD" \
@@ -142,12 +150,22 @@ if command -v c8 >/dev/null 2>&1; then
       ISSUES=$((ISSUES+1))
     fi
   fi
+  # G6-FN1: detect zero-tests-discovered scenario (vacuous 100% coverage pass).
+  # TAP output "1..0" means the plan was 0 tests; also check for absence of "ok " lines.
+  if grep -qE '^1\.\.0$' "$TMPLOG" 2>/dev/null || \
+     { ! grep -qE '^(ok|not ok)[[:space:]]+[0-9]' "$TMPLOG" 2>/dev/null && grep -qE '100' "$TMPLOG" 2>/dev/null; }; then
+    printf 'WARN:package.json:0\tzero tests discovered — check test file patterns and globs\n'
+  fi
 else
   NODE_MAJ=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
   if [ -n "$NODE_MAJ" ] && [ "$NODE_MAJ" -ge 22 ] 2>/dev/null; then
     # Node v22+ has built-in coverage; runs tests and collects coverage in one pass.
     # Use the project's explicit test glob if the test script invokes node --test directly.
     _test_script=$(jq -r '.scripts.test // empty' package.json 2>/dev/null || true)
+    # G6-FN1: detect single-quoted globs in node --test scripts.
+    if echo "$_test_script" | grep -qE "node[[:space:]].*--test.*'[^']*[*][^']*'"; then
+      printf 'WARN:package.json:0\tglob quoting may prevent test discovery — use double-quoted or unquoted globs for node --test file patterns\n'
+    fi
     _extra_args=""
     if echo "$_test_script" | grep -qE '^node[[:space:]].*--test'; then
       _extra_args=$(echo "$_test_script" | grep -oE '[^ ]*(\*|\.js|\.ts)[^ ]*' | head -1 || true)
@@ -192,6 +210,11 @@ else
         ISSUES=$((ISSUES+1))
       fi
     fi
+    # G6-FN1: detect zero-tests-discovered scenario (vacuous 100% coverage pass).
+    if grep -qE '^1\.\.0$' "$TMPLOG" 2>/dev/null || \
+       { ! grep -qE '^(ok|not ok)[[:space:]]+[0-9]' "$TMPLOG" 2>/dev/null && grep -qE '100' "$TMPLOG" 2>/dev/null; }; then
+      printf 'WARN:package.json:0\tzero tests discovered — check test file patterns and globs\n'
+    fi
   else
     # No coverage tool available — run npm test once for pass/fail, warn on coverage.
     set +e
@@ -214,7 +237,7 @@ else
       done < "$TMPLOG"
       [ "$TAP_COUNT" -eq 0 ] && { printf 'package.json:0\ttest suite failed — fix failing tests before proceeding\n'; ISSUES=$((ISSUES+1)); }
     fi
-    printf 'WARN: package.json:0\tJS coverage threshold enforcement requires c8 (npm install -g c8) or Node.js v22+\n'
+    printf 'WARN:package.json:0\tJS coverage threshold enforcement requires c8 (npm install -g c8) or Node.js v22+\n'
     # Do not increment ISSUES — missing tool is an env limitation, not a code defect
   fi
 fi
@@ -231,7 +254,13 @@ while IFS= read -r f; do
     printf '%s:0\ttest file has no assertion calls\n' "$rel"
     ISSUES=$((ISSUES+1))
   fi
-done < <(find "$ROOT" -maxdepth 8 -not -path "*/node_modules/*" \( \
+done < <(find "$ROOT" -maxdepth 8 \
+  -not -path "*/node_modules/*" \
+  -not -path "*/dist/*" \
+  -not -path "*/coverage/*" \
+  -not -path "*/build/*" \
+  -not -path "*/.next/*" \
+  \( \
     -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \
     -o -path "*/test/*.js" -o -path "*/tests/*.js" -o -path "*/__tests__/*.js" \
     -o -path "*/test/*.ts" -o -path "*/tests/*.ts" -o -path "*/__tests__/*.ts" \
@@ -250,12 +279,14 @@ while IFS= read -r f; do
   if [ -z "$f" ]; then continue; fi
   while IFS=: read -r lineno rest; do
     if [ -z "$lineno" ]; then continue; fi
-    if echo "$rest" | grep -qE 'karen-ignore|skip'; then continue; fi
+    # Tightened suppression: require karen-ignore as explicit directive, or
+    # "skip" as a standalone word immediately after a comment marker (// or #).
+    if echo "$rest" | grep -qE 'karen-ignore'; then continue; fi
+    if echo "$rest" | grep -qE '(//|#)[[:space:]]*skip([[:space:]]|$)'; then continue; fi
     rel="${f#$ROOT/}"
     printf '%s:%s\tlive credential env var read in test\n' "$rel" "$lineno"
     ISSUES=$((ISSUES+1))
-  done < <({ grep -nE "process\.env\.([A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_]*|API_[A-Z0-9_]+|ADMIN_[A-Z0-9_]+)" "$f"; \
-             grep -nE "process\.env\[|const[[:space:]]*\{[^}]*(KEY|TOKEN|SECRET|PASSWORD)" "$f"; } 2>/dev/null | sort -t: -k1,1n || true)
+  done < <(grep -nE "process\.env\.([A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_]*|API_[A-Z0-9_]+|ADMIN_[A-Z0-9_]+)|process\.env\[|const[[:space:]]*\{[^}]*(KEY|TOKEN|SECRET|PASSWORD)" "$f" 2>/dev/null | sort -t: -k1,1n -u || true)
 done < <(find "$ROOT" -maxdepth 8 -not -path "*/node_modules/*" \( \
     -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \
     -o -path "*/test/*.js" -o -path "*/tests/*.js" -o -path "*/__tests__/*.js" \

@@ -13,7 +13,7 @@ if [ ! -f README.md ]; then
   ISSUES=$((ISSUES+1))
   SUMMARY_EMITTED=1
   echo "FAIL ($ISSUES issues)"
-  exit 0
+  exit 1
 fi
 
 # Check Karen's own CLI commands only when this is the Karen repository itself.
@@ -40,7 +40,8 @@ if [ -n "$GO_FILES_PROBE" ]; then
   trap "_ec=\$?; rm -f '$DOCS_TMP'; if [ \"\$SUMMARY_EMITTED\" -eq 0 ]; then printf 'GATE_CRASH:0\tgate crashed (exit %s)\n' \"\$_ec\"; echo 'FAIL (1 issues)'; fi" EXIT
   # ISSUE 10: scan all .md files (not just README + ./docs/) to cover ./doc/, other locations
   {
-    find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' 2>/dev/null \
+    find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' \
+      -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/.next/*' -not -path '*/coverage/*' 2>/dev/null \
       | while IFS= read -r mdf; do
       cat "$mdf" 2>/dev/null || true
     done
@@ -56,7 +57,7 @@ if [ -n "$GO_FILES_PROBE" ]; then
     fi
   # ISSUE 1 & 6: --exclude-dir=vendor and --exclude generated files; ISSUE 9: no head -100 cap
   done < <(grep -rn --include="*.go" --exclude='*.pb.go' --exclude='zz_generated.*.go' --exclude='mock_*.go' --exclude-dir=vendor -E '^func [A-Z]|^type [A-Z]' . 2>/dev/null \
-    | grep -v '_test.go' | grep -v '.git' || true)
+    | grep -v '_test.go' | grep -v '.git' | grep -v 'karen-ignore' || true)
 fi
 
 # --- CHECK 2: Signature drift ---
@@ -81,7 +82,7 @@ if [ -n "$GO_FILES_PROBE" ]; then
     fi
   # ISSUE 1 & 6: --exclude-dir=vendor and --exclude generated files; ISSUE 9: no head -100 cap
   done < <(grep -rn --include="*.go" --exclude='*.pb.go' --exclude='zz_generated.*.go' --exclude='mock_*.go' --exclude-dir=vendor -E '^func [A-Z]' . 2>/dev/null \
-    | grep -v '_test.go' | grep -v '.git' || true)
+    | grep -v '_test.go' | grep -v '.git' | grep -v 'karen-ignore' || true)
 fi
 
 # --- CHECK 2b: JS exported-symbol coverage — analog of Go exported func/type check ---
@@ -100,7 +101,7 @@ if [ ! -f go.mod ]; then
 
   if [ -n "$JS_SRC" ]; then
     if [ ! -f "$ROOT/.karen.json" ]; then
-      printf 'WARN:.karen.json:0\t.karen.json absent — JS public API symbol coverage check skipped; create .karen.json with docs.publicApiSymbols or docs.publicApiFiles to enable\n'
+      printf 'SKIP: add publicApiFiles to .karen.json to enable API surface check\n' >&2
     else
       # Read public API config (jq preferred; skip check entirely on fallback failure).
       JS_PUBLIC_SYMBOLS=""
@@ -180,10 +181,10 @@ fi
 _extract_md_links() {
   local mdfile="$1"
   if command -v perl &>/dev/null; then
-    perl -ne 'while (/\]\(([^)]+)\)/g) { print "$1\n" }' "$mdfile" 2>/dev/null || true
+    perl -ne 'next if /karen-ignore/; while (/\]\(([^)]+)\)/g) { print "$1\n" }' "$mdfile" 2>/dev/null || true
   else
     # Pure-bash fallback: one link per line covered; multi-link lines may miss extras.
-    grep -oE '\]\([^)]+\)' "$mdfile" 2>/dev/null | sed 's/^](\(.*\))$/\1/' || true
+    grep -v 'karen-ignore' "$mdfile" 2>/dev/null | grep -oE '\]\([^)]+\)' | sed 's/^](\(.*\))$/\1/' || true
   fi
 }
 
@@ -208,7 +209,8 @@ while IFS= read -r mdfile; do
   done < <(_extract_md_links "$mdfile" \
     | grep -v '^https\?://' | grep -v '^http://' | grep -v '^mailto:' | grep -v '^#' | grep -v '^//' || true)
 # ISSUE 12: scan all .md files, not just README.md + ./docs/*.md
-done < <(find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' 2>/dev/null \
+done < <(find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' \
+  -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/.next/*' -not -path '*/coverage/*' 2>/dev/null \
   | sort -u || true)
 
 # --- CHECK 4: CHANGELOG gaps ---
@@ -235,15 +237,30 @@ if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
   elif [ -n "$last_tag" ]; then
     # No CHANGELOG.md but a release tag exists — step 2: check GitHub Releases.
     GH_RELEASES_FRESH=0
+    GH_CLI_AVAILABLE=0
     if command -v gh &>/dev/null; then
       # Verify the most recent GH release corresponds to the most recent git tag and has notes.
+      # Capture stderr to detect auth/network errors without letting them propagate as failures.
       if command -v jq &>/dev/null; then
-        _latest_gh_tag=$(gh release list --limit 1 --json tagName 2>/dev/null \
-          | jq -r '.[0].tagName // ""' 2>/dev/null || true)
+        _gh_list_out=$(gh release list --limit 1 --json tagName 2>&1)
+        _gh_list_ec=$?
+        if [ "$_gh_list_ec" -ne 0 ]; then
+          printf 'WARN: gh CLI unavailable --- GitHub Releases freshness check skipped; install gh and authenticate to enable full check\n' >&2
+        else
+          GH_CLI_AVAILABLE=1
+          _latest_gh_tag=$(echo "$_gh_list_out" | jq -r '.[0].tagName // ""' 2>/dev/null || true)
+        fi
       else
-        _latest_gh_tag=$(gh release list --limit 1 2>/dev/null | awk 'NR==1{print $1}' || true)
+        _gh_list_out=$(gh release list --limit 1 2>&1)
+        _gh_list_ec=$?
+        if [ "$_gh_list_ec" -ne 0 ]; then
+          printf 'WARN: gh CLI unavailable --- GitHub Releases freshness check skipped; install gh and authenticate to enable full check\n' >&2
+        else
+          GH_CLI_AVAILABLE=1
+          _latest_gh_tag=$(echo "$_gh_list_out" | awk 'NR==1{print $1}' || true)
+        fi
       fi
-      if [ -n "$_latest_gh_tag" ]; then
+      if [ "$GH_CLI_AVAILABLE" -eq 1 ] && [ -n "$_latest_gh_tag" ]; then
         _gh_json=$(gh release view "$_latest_gh_tag" --json body 2>/dev/null || true)
         if command -v jq &>/dev/null; then
           _gh_body=$(echo "$_gh_json" | jq -r '.body // ""' 2>/dev/null || true)
@@ -254,6 +271,8 @@ if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
         _gh_stripped=$(echo "$_gh_body" | tr -d '[:space:]')
         [ "${#_gh_stripped}" -gt 20 ] && GH_RELEASES_FRESH=1
       fi
+    else
+      printf 'WARN:gh:0\tgh CLI unavailable --- GitHub Releases freshness check skipped; install gh and authenticate to enable full check\n'
     fi
 
     if [ "$GH_RELEASES_FRESH" -eq 1 ]; then
@@ -266,8 +285,11 @@ if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
       else
         : # GitHub Releases in sync with latest tag — preferred practice, no action needed
       fi
+    elif [ "${GH_CLI_AVAILABLE:-0}" -eq 0 ]; then
+      # gh was unavailable — cannot confirm release notes; skip rather than FAIL.
+      : # WARN already emitted above; do not penalize projects that lack gh CLI
     else
-      # Step 3: neither CHANGELOG.md nor GitHub Releases with notes.
+      # Step 3: gh was available but found no substantive release notes — flag as a gap.
       printf 'CHANGELOG.md:0\tgit tag "%s" exists but no changelog — create CHANGELOG.md or publish GitHub Releases with release notes\n' "$last_tag"
       ISSUES=$((ISSUES+1))
     fi
@@ -377,7 +399,8 @@ fi
 SUMMARY_EMITTED=1
 if [ "$ISSUES" -eq 0 ]; then
   echo "PASS (0 issues)"
+  exit 0
 else
   echo "FAIL ($ISSUES issues)"
+  exit 1
 fi
-exit 0
