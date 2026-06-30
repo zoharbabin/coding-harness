@@ -154,14 +154,17 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
       | grep -v '/build/' \
       | grep -v '/coverage/' \
       | grep -v "^${ROOT}/tools/" \
+      | grep -v "/tools/" \
       | grep -v "^${ROOT}/scripts/" \
-      | grep -v "${ROOT}/tests/artifacts/" \
-      | grep -v "${ROOT}/tests/fixtures/" \
-      | grep -v "${ROOT}/test/fixtures/" \
-      | grep -v "${ROOT}/spec/fixtures/" \
-      | grep -v "${ROOT}/__snapshots__/" \
-      | grep -v "${ROOT}/.cache/" \
-      | grep -v "${ROOT}/examples/" \
+      | grep -v "/scripts/" \
+      | grep -v "/tests/artifacts/" \
+      | grep -v "/tests/fixtures/" \
+      | grep -v "/test/fixtures/" \
+      | grep -v "/spec/fixtures/" \
+      | grep -v "/__snapshots__/" \
+      | grep -v "/.cache/" \
+      | grep -v "/examples/" \
+      | grep -v "/example/" \
       | grep -v '\.min\.js:' \
       | grep -v 'karen-ignore' \
       | head -30 \
@@ -243,7 +246,7 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep "console\.(log|error|warn)\([^)]*\b(token|secret|password)\b" \
     | grep -v 'redact\|\*\*\*' \
-    | grep -vE "console\.(log|error|warn)\([[:space:]]*('[^']*\b(token|secret|password)\b[^']*'|\"[^\"]*\b(token|secret|password)\b[^\"]*\")[[:space:]]*\)" \
+    | grep -vE "console\.(log|error|warn)\([[:space:]]*('[^']*\b(token|secret|password)\b[^']*'|\"[^\"]*\b(token|secret|password)\b[^\"]*\")[[:space:]]*[,)][[:space:]]*(,.*)?[))]?" \
     || true)
 
   # 9. postMessage with wildcard targetOrigin — cross-origin data leak

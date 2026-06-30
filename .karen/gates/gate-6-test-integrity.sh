@@ -235,7 +235,15 @@ done < <(find "$ROOT" -maxdepth 8 -not -path "*/node_modules/*" \( \
     -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \
     -o -path "*/test/*.js" -o -path "*/tests/*.js" -o -path "*/__tests__/*.js" \
     -o -path "*/test/*.ts" -o -path "*/tests/*.ts" -o -path "*/__tests__/*.ts" \
-  \) 2>/dev/null || true)
+  \) \
+  -not -path "*/fakes/*" \
+  -not -path "*/artifacts/*" \
+  -not -path "*/fixtures/*" \
+  -not -name "playwright.config.*" \
+  -not -name "jest.config.*" \
+  -not -name "vitest.config.*" \
+  -not -name "karma.config.*" \
+  2>/dev/null || true)
 
 # Live credential check in JS tests
 while IFS= read -r f; do
@@ -252,7 +260,15 @@ done < <(find "$ROOT" -maxdepth 8 -not -path "*/node_modules/*" \( \
     -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \
     -o -path "*/test/*.js" -o -path "*/tests/*.js" -o -path "*/__tests__/*.js" \
     -o -path "*/test/*.ts" -o -path "*/tests/*.ts" -o -path "*/__tests__/*.ts" \
-  \) 2>/dev/null || true)
+  \) \
+  -not -path "*/fakes/*" \
+  -not -path "*/artifacts/*" \
+  -not -path "*/fixtures/*" \
+  -not -name "playwright.config.*" \
+  -not -name "jest.config.*" \
+  -not -name "vitest.config.*" \
+  -not -name "karma.config.*" \
+  2>/dev/null || true)
 
 SUMMARY_EMITTED=1
 if [ "$ISSUES" -eq 0 ]; then

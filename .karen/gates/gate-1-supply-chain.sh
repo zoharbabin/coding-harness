@@ -47,6 +47,8 @@ if command -v npm &>/dev/null; then
     [ -z "$pkgjson" ] && continue
     pkgdir=$(dirname "$pkgjson")
     if [ ! -f "$pkgdir/package-lock.json" ] && [ ! -f "$pkgdir/yarn.lock" ]; then
+      # Zero-dep packages have nothing to lock — only warn when dependencies/devDependencies are declared.
+      grep -qE '"(dependencies|devDependencies)"' "$pkgjson" 2>/dev/null || continue
       rel="${pkgjson#"$ROOT"/}"
       printf 'WARN:%s:0\tpackage.json has no lockfile (package-lock.json or yarn.lock) — dependency versions are unpinned and npm audit will be skipped; run npm install to generate a lockfile\n' "$rel"
     fi

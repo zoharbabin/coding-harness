@@ -142,8 +142,8 @@ for f in "${LLM_JS_FILES[@]+"${LLM_JS_FILES[@]}"}"; do
   while IFS=: read -r file line rest; do
     printf '%s:%s\tJS LLM: potential prompt injection via string concat — verify user input is sanitized before insertion\n' "$f" "$file"
     ISSUES=$((ISSUES+1))
-  done < <({ grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=\n]*=[^=].*\+' "$f" 2>/dev/null; \
-             grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=\n]*=.*`[^`]*\$\{' "$f" 2>/dev/null; } | grep -v 'karen-ignore' | head -5 || true)
+  done < <({ grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=]*=[^=].*\+' "$f" 2>/dev/null; \
+             grep -nE '\b(prompt|systemPrompt|userMessage|instruction)\b[^=]*=.*`[^`]*\$\{' "$f" 2>/dev/null; } | grep -v 'karen-ignore' | head -5 || true)
 done
 
 # Context-file declaration check for prompt injection policy.

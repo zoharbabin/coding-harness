@@ -60,6 +60,9 @@ done < <(find "$ROOT" -maxdepth 8 -type f \( -name "*.js" -o -name "*.mjs" -o -n
 if [ "${#JS_FILES[@]}" -gt 0 ]; then
   for jsf in "${JS_FILES[@]}"; do
     relfile="${jsf#$ROOT/}"
+    # Skip binary/null-byte files — grep -n on binary files emits "Binary file … matches"
+    # which has no colon-delimited line number and causes $((lineno)) to fail under set -u.
+    grep -Iq . "$jsf" 2>/dev/null || continue
     while IFS= read -r rawline; do
       [ -z "$rawline" ] && continue
       # Extract line number and content
