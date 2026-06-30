@@ -18,44 +18,50 @@ trap '_ec=$?; if [ "$SUMMARY_EMITTED" -eq 0 ]; then printf "GATE_CRASH:0\tgate c
 # If a project places sensitive Go files under a path matching */testdata/* they
 # will be silently excluded; prefer storing fixtures without real credentials.
 
+# Issue 1/16: karen-ignore suppression added to all Go pipelines.
+# Issue 6: case-insensitive (-i), camelCase-aware (.?), broader token alternation.
+# Issue 14: \b word boundary added before keyword group.
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tpotential hardcoded secret — rotate immediately\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E '(api_?key|auth_?token|secret_?key|password|passwd)[[:space:]]*[:=][[:space:]]*"[^"]{8,}"' \
-  . 2>/dev/null | head -50 || true)
+  -iE '\b(api.?key|auth.?token|secret.?key|access.?token|client.?secret|bearer.?token|password|passwd)\b[[:space:]]*[:=][[:space:]]*"[^"]{8,}"' \
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 18: full-path shell invocations and cmd.exe /c added to alternation.
 while IFS=: read -r file line rest; do
-  if [[ "$file" == *_test.go ]]; then continue; fi
+  if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\texec with shell -c pattern — use exec.Command with explicit args array\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E '"(sh|bash|cmd|powershell)"[[:space:]]*,[[:space:]]*"-c"' \
-  . 2>/dev/null | head -50 || true)
+  -E '"(/bin/sh|/usr/bin/bash|/bin/bash|sh|bash|zsh|cmd|cmd\.exe|powershell|pwsh)"[[:space:]]*,[[:space:]]*"(-c|/c)"' \
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
 while IFS=: read -r file line rest; do
-  if [[ "$file" == *_test.go ]] || [[ "$file" == */wizard/generator.go ]]; then continue; fi
+  if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tInsecureSkipVerify: true — disabled TLS certificate verification\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  'InsecureSkipVerify:[[:space:]]*true' . 2>/dev/null | head -50 || true)
+  'InsecureSkipVerify:[[:space:]]*true' . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 20: exec.CommandContext added alongside exec.Command.
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tdynamic command construction — use exec.Command with literal executable and explicit args array\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E 'syscall\.Exec[[:space:]]*\(|exec\.Command[[:space:]]*\([^"]*\+' \
-  . 2>/dev/null | head -50 || true)
+  -E 'syscall\.Exec[[:space:]]*\(|exec\.Command(Context)?[[:space:]]*\([^"]*\+' \
+  . 2>/dev/null | grep -v '/vendor/' | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 11: pattern tightened to require query structure (% format verb) to reduce false positives on error-message strings.
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tSQL built with fmt.Sprintf — use parameterized queries\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E 'fmt\.Sprintf[[:space:]]*\([[:space:]]*"[^"]*\b(SELECT|INSERT|UPDATE|DELETE|WHERE)\b' \
-  . 2>/dev/null | head -50 || true)
+  -E 'fmt\.Sprintf[[:space:]]*\([[:space:]]*"[^"]*\b(SELECT|INSERT|UPDATE|DELETE)\b[^"]*%(s|v|d)' \
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
@@ -63,15 +69,16 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E '"[[:space:]]*(SELECT|INSERT|UPDATE|DELETE)[^"]*"[[:space:]]*\+' \
-  . 2>/dev/null | head -50 || true)
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 19: os.OpenFile added to alternation.
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tfile path assembled via concatenation — use a safe allowlist or filepath.Clean with validated prefix\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E 'os\.(Open|Create|ReadFile|WriteFile)[[:space:]]*\(.*\+|filepath\.Join[[:space:]]*\(.*\+' \
-  . 2>/dev/null | head -50 || true)
+  -E 'os\.(Open|OpenFile|Create|ReadFile|WriteFile)[[:space:]]*\(.*\+|filepath\.Join[[:space:]]*\(.*\+' \
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
@@ -79,32 +86,36 @@ while IFS=: read -r file line rest; do
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
   -E 'http\.(Get|Post|Do|Head)[[:space:]]*\([[:space:]]*"http://' \
-  . 2>/dev/null | head -50 || true)
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 4: bare 'auth' removed from alternation to avoid false positives on auth-flow log lines.
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\tcredential-related name in log statement — avoid logging tokens, passwords, or secrets\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E '(log\.|fmt\.Print|fmt\.Fprintf|fmt\.Fprintln).*\b(token|password|passwd|secret|api_?key|auth|credential)\b' \
-  . 2>/dev/null | head -50 || true)
+  -E '(log\.|fmt\.Print|fmt\.Fprintf|fmt\.Fprintln).*\b(token|password|passwd|secret|api_?key|credential)\b' \
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
+# Issue 15: pattern split so 'key' match requires it not be a file extension (.key).
 while IFS=: read -r file line rest; do
   if [[ "$file" == *_test.go ]] || [[ "$file" == */testdata/* ]]; then continue; fi
   printf '%s:%s\twriting credential to file — ensure file permissions are restricted and path is not world-readable\n' "$file" "$line"
   ISSUES=$((ISSUES+1))
 done < <(grep -rn --include="*.go" \
-  -E 'os\.(WriteFile|Create)[[:space:]]*\(.*\b(token|secret|password|key)\b' \
-  . 2>/dev/null | head -50 || true)
+  -E 'os\.(WriteFile|Create)[[:space:]]*\(.*\b(token|secret|password)\b|os\.(WriteFile|Create)[[:space:]]*\([^"]*\bkey\b' \
+  . 2>/dev/null | grep -v 'karen-ignore' | head -50 || true)
 
 # --- JS SAST ---
-# Run when *.js or *.mjs files exist outside excluded directories.
+# Run when *.js, *.mjs, *.ts, *.tsx, *.jsx, or *.cjs files exist outside excluded directories.
 
+# Issue 5: Probe extended to include TypeScript and JSX extensions.
+# Use -print -quit (capture to variable) instead of piping to grep -q to avoid the
+# pipefail+SIGPIPE bug: with `set -euo pipefail`, `find ... | grep -q .` causes find
+# to receive SIGPIPE (exit 141) when grep exits on first match, making pipefail surface
+# a non-zero exit and silently skipping the entire JS SAST block.
 JS_FILES_EXIST=0
-# Exclusions are root-anchored (using $ROOT prefix) to prevent nested-path bypass.
-# A file at src/tests/artifacts/ must still be scanned — only top-level test output
-# directories are excluded.
-if find "$ROOT" \
+JS_FILES_PROBE=$(find "$ROOT" \
     -path "$ROOT/node_modules" -prune -o \
     -path "$ROOT/.git" -prune -o \
     -path "$ROOT/dist" -prune -o \
@@ -118,15 +129,14 @@ if find "$ROOT" \
     -path "$ROOT/spec/fixtures" -prune -o \
     -path "$ROOT/__snapshots__" -prune -o \
     -path "$ROOT/.cache" -prune -o \
-    \( -name "*.js" -o -name "*.mjs" \) -not -name "*.min.js" -print \
-    2>/dev/null | grep -q .; then
-  JS_FILES_EXIST=1
-fi
+    \( -name "*.js" -o -name "*.mjs" -o -name "*.ts" -o -name "*.tsx" -o -name "*.jsx" -o -name "*.cjs" \) -not -name "*.min.js" -print -quit \
+    2>/dev/null || true)
+[ -n "$JS_FILES_PROBE" ] && JS_FILES_EXIST=1
 
 if [ "$JS_FILES_EXIST" -eq 1 ]; then
   JS_ISSUES=0
 
-  # Helper: grep JS files excluding standard noise dirs and minified files.
+  # Helper: grep JS/TS files excluding standard noise dirs and minified files.
   # Playwright/Cypress trace bundles and test fixtures contain minified vendor JS;
   # tools/ and scripts/ dirs may contain scanner definitions with pattern references.
   # Usage: js_grep <grep -E pattern>
@@ -135,14 +145,16 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
     # Exclusions are anchored to the project root ($ROOT) to prevent nested-path bypass
     # (e.g. src/tests/artifacts/ must not silently skip first-party source files).
     # Only top-level test output directories are excluded, not arbitrary nested paths.
-    grep -rn --include="*.js" --include="*.mjs" -E "$1" -- "$ROOT" 2>/dev/null \
+    # Issue 8: tools/ and scripts/ exclusions anchored to $ROOT to match stated design invariant.
+    # Issue 5: TypeScript and JSX extensions added.
+    grep -rn --include="*.js" --include="*.mjs" --include="*.ts" --include="*.tsx" --include="*.jsx" --include="*.cjs" -E "$1" -- "$ROOT" 2>/dev/null \
       | grep -v '/node_modules/' \
       | grep -v '/\.git/' \
       | grep -v '/dist/' \
       | grep -v '/build/' \
       | grep -v '/coverage/' \
-      | grep -v '/tools/' \
-      | grep -v '/scripts/' \
+      | grep -v "^${ROOT}/tools/" \
+      | grep -v "^${ROOT}/scripts/" \
       | grep -v "${ROOT}/tests/artifacts/" \
       | grep -v "${ROOT}/tests/fixtures/" \
       | grep -v "${ROOT}/test/fixtures/" \
@@ -156,59 +168,72 @@ if [ "$JS_FILES_EXIST" -eq 1 ]; then
   }
 
   # 1. Hardcoded secrets
+  # Issue 7: backtick delimiter added; $ removed from exclusion class so secrets containing $ are caught.
+  # Issue 9: 'test' removed from suppression list (substring false negatives); word boundaries on remaining terms.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS potential hardcoded secret — rotate immediately\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
-  done < <(js_grep "(api_key|auth_token|secret_key|password|passwd)[[:space:]]*[=:][[:space:]]*['\"][^'\"$]{8,}['\"]" \
-    | grep -v 'process\.env\|placeholder\|example\|dummy\|test' || true)
+  done < <(js_grep "(api_key|auth_token|secret_key|password|passwd)[[:space:]]*[=:][[:space:]]*['\"\`][^'\"\` ]{8,}['\"\`]" \
+    | grep -vE 'process\.env|\bplaceholder\b|\bexample\b|\bdummy\b' || true)
 
   # 2. Shell exec (child_process) — zero-tolerance in production; test files excluded.
   # BLUEPRINT: "Zero-tolerance means no exceptions in production code. Test files are
   # excluded — they may deliberately exercise these patterns to verify their scanner."
+  # Issue 13: /tests/ and /test/ and /integration/ directory exclusions added.
+  # Issue 17: destructured require('child_process') pattern added.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS child_process exec/spawn — audit for unsanitized user input in arguments\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
-  done < <(js_grep "child_process\.(exec|spawn|execSync|spawnSync)\(" \
-    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' || true)
+  done < <({ js_grep "child_process\.(exec|spawn|execSync|spawnSync|execFile|execFileSync|fork)\("; \
+    js_grep "require\(['\"]child_process['\"]\)" | grep -v 'karen-ignore'; } \
+    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' | grep -v '/tests/' | grep -v '/test/' | grep -v '/integration/' || true)
 
   # 3. TLS bypass — zero-tolerance in production; test files excluded.
+  # Issue 13: /tests/ and /test/ and /integration/ directory exclusions added.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS rejectUnauthorized: false — disabled TLS certificate verification\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep "rejectUnauthorized[[:space:]]*:[[:space:]]*false" \
-    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' || true)
+    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' | grep -v '/tests/' | grep -v '/test/' | grep -v '/integration/' || true)
 
   # 4. eval() call — zero-tolerance in production; test files excluded.
+  # Issue 3: method-call forms excluded (e.g. mathParser.eval()) to avoid false positives from libraries.
+  # Issue 13: /tests/ and /test/ and /integration/ directory exclusions added.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS eval() call — dynamic code execution; use safer alternatives\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
   done < <(js_grep "\beval[[:space:]]*\(" \
-    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' || true)
+    | grep -v '\.[a-zA-Z_][a-zA-Z_0-9]*eval[[:space:]]*(' \
+    | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '/__tests__/' | grep -v '/tests/' | grep -v '/test/' | grep -v '/integration/' || true)
 
   # 5. innerHTML assignment
+  # Issue 2: pattern tightened to require = not followed by another = to exclude === and == comparisons.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS innerHTML assignment — potential XSS; use textContent or sanitize input\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
-  done < <(js_grep "\.innerHTML[[:space:]]*[+]?=")
+  done < <(js_grep "\.innerHTML[[:space:]]*[+]?=[^=]")
 
   # 6. SQL string concatenation
+  # Issue 10: pattern anchored to require SQL keyword inside a string context (quote before keyword).
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS SQL built via string concatenation — use parameterized queries\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
-  done < <(js_grep "(SELECT|INSERT|UPDATE|DELETE).*\+")
+  done < <(js_grep "['\"\`][^'\"\`]*(SELECT|INSERT|UPDATE|DELETE).*\+")
 
   # 7. Cleartext HTTP fetch
+  # Issue 12: comment-line filter added to suppress JSDoc and inline code examples.
   while IFS=: read -r file line rest; do
     [ -z "$file" ] && continue
     printf '%s:%s\tJS cleartext HTTP fetch — use https://\n' "$file" "$line"
     JS_ISSUES=$((JS_ISSUES+1))
-  done < <(js_grep "fetch\([[:space:]]*['\"]http://")
+  done < <(js_grep "fetch\([[:space:]]*['\"]http://" \
+    | grep -v '^[^:]*:[0-9]*:[[:space:]]*//' || true)
 
   # 8. Credential logging
   while IFS=: read -r file line rest; do
@@ -231,6 +256,6 @@ if [ "$ISSUES" -eq 0 ]; then
   echo "PASS (0 issues)"
 else
   printf 'FAIL (%s issues)\n' "$ISSUES"
-  printf 'ZERO-TOLERANCE: Karen will not negotiate on this.\n'
+  echo "ZERO-TOLERANCE"
 fi
 exit 0

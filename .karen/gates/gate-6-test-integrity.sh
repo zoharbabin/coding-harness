@@ -6,7 +6,9 @@ ISSUES=0
 # karen-ignore: add this comment to any line to suppress it from Karen gate scanning.
 
 SUMMARY_EMITTED=0
-trap '_ec=$?; if [ "$SUMMARY_EMITTED" -eq 0 ]; then printf "GATE_CRASH:0\tgate crashed (exit %s)\n" "$_ec"; echo "FAIL (1 issues)"; fi' EXIT
+TMPLOG=""
+COVERAGE_FILE=""
+trap '_ec=$?; rm -f "$TMPLOG" "$COVERAGE_FILE"; if [ "$SUMMARY_EMITTED" -eq 0 ]; then printf "GATE_CRASH:0\tgate crashed (exit %s)\n" "$_ec"; echo "FAIL (1 issues)"; fi' EXIT
 
 # ── Go branch ────────────────────────────────────────────────────────────────
 if [ -f go.mod ]; then
@@ -25,6 +27,7 @@ if [ -f go.mod ]; then
     CONFIGURED=$(jq -r '.coverage.threshold // empty' "$ROOT/.karen.json" 2>/dev/null)
     [ -n "$CONFIGURED" ] && THRESHOLD="$CONFIGURED"
   fi
+  THRESHOLD=$(echo "$THRESHOLD" | cut -d. -f1)
 
   if [ -f "$COVERAGE_FILE" ]; then
     COV_LINE=$(go tool cover -func="$COVERAGE_FILE" 2>/dev/null | tail -1)
@@ -43,22 +46,27 @@ if [ -f go.mod ]; then
   while IFS= read -r -d '' f; do
     rel="${f#$ROOT/}"
     while IFS=: read -r lineno funcname; do
-      funcbody=$(awk "NR==$lineno,/^func / && NR>$lineno" "$f" | tail -n +2)
-      if ! echo "$funcbody" | grep -qE 't\.(Error|Fatal|Fail|Errorf|Fatalf)|assert\.|require\.|if.*t\.'; then
+      funcbody=$(awk "NR>$lineno && /^func /{exit} NR>=$lineno{print}" "$f" | tail -n +2)
+      funcline=$(sed -n "${lineno}p" "$f")
+      if echo "$funcline" | grep -qE 'karen-ignore'; then continue; fi
+      if ! echo "$funcbody" | grep -qE 't\.(Error|Fatal|Fail|Errorf|Fatalf)|assert\.|require\.|if.*t\.(Error|Fatal|Fail|FailNow|Skip)|Expect\(|Eventually\(|Consistently\(|\.AssertExpectations\('; then
         printf '%s:%s\t%s — test function has no assertions — produces false confidence\n' "$rel" "$lineno" "$funcname"
         ISSUES=$((ISSUES+1))
       fi
-    done < <(grep -nE '^func Test[^(]+\(' "$f" | sed -E 's/^([0-9]+):func ([^(]+)\(.*/\1:\2/' || true)
+    done < <(grep -nE '^func Test[^(]+\(' "$f" | grep -v ':TestMain(' | sed -E 's/^([0-9]+):func ([^(]+)\(.*/\1:\2/' || true)
   done < <(find "$ROOT" -name '*_test.go' -not -path '*/vendor/*' -print0 2>/dev/null)
 
   # Live credential usage: tests must not require real credentials to pass
   while IFS= read -r -d '' f; do
     rel="${f#$ROOT/}"
-    if grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Z_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Z_]*"' "$f" | \
-       grep -qvE '^\s*(//|t\.Skip)'; then
-      lineno=$(grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Z_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Z_]*"' "$f" | head -1 | cut -d: -f1)
-      printf '%s:%s\tlive credential read in test — add t.Skip when credential is absent\n' "$rel" "$lineno"
-      ISSUES=$((ISSUES+1))
+    if grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | \
+       cut -d: -f2- | grep -qvE '^[[:space:]]*(//|t\.Skip|.*karen-ignore)'; then
+      # Also check if t.Skip appears within 3 lines after each match
+      if ! grep -A3 -E 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | grep -qE 't\.Skip|karen-ignore'; then
+        lineno=$(grep -nE 'os\.(Getenv|LookupEnv)[[:space:]]*\([[:space:]]*"[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)[A-Za-z0-9_]*"' "$f" | head -1 | cut -d: -f1)
+        printf '%s:%s\tlive credential read in test — add t.Skip when credential is absent\n' "$rel" "$lineno"
+        ISSUES=$((ISSUES+1))
+      fi
     fi
   done < <(find "$ROOT" -name '*_test.go' -not -path '*/vendor/*' -print0 2>/dev/null)
 
@@ -75,9 +83,9 @@ fi
 
 # Discover testable package: check $ROOT/package.json then $ROOT/sdk/package.json
 TEST_PKG_DIR=""
-for candidate_dir in "$ROOT" "$ROOT/sdk"; do
+for candidate_dir in "$ROOT" "$ROOT/sdk" $(find "$ROOT" -maxdepth 3 -name 'package.json' -not -path '*/node_modules/*' -exec dirname {} \; 2>/dev/null | grep -v "^$ROOT$" | grep -v "^$ROOT/sdk$"); do
   candidate="$candidate_dir/package.json"
-  if [ -f "$candidate" ] && grep -q '"test"' "$candidate"; then
+  if [ -f "$candidate" ] && jq -e '.scripts.test' "$candidate" >/dev/null 2>&1; then
     TEST_PKG_DIR="$candidate_dir"
     break
   fi
@@ -95,14 +103,22 @@ fi
 # Never re-run tests after a coverage pass — that would double execution time and
 # risk stateful side-effects.
 THRESHOLD=$(jq -r ".coverage.threshold // 80" "$ROOT/.karen.json" 2>/dev/null || echo "80")
+THRESHOLD=$(echo "$THRESHOLD" | cut -d. -f1)
 TMPLOG="/tmp/karen-js-test-$$"
 cd "$TEST_PKG_DIR"
 
 if command -v c8 >/dev/null 2>&1; then
-  # c8 runs node --test with V8 coverage in a single pass — no separate npm test needed.
+  # c8 runs tests with V8 coverage in a single pass.
+  # If the project uses jest, vitest, mocha, or jasmine, wrap npm test instead of node --test.
+  TEST_SCRIPT=$(jq -r '.scripts.test // empty' package.json 2>/dev/null)
   set +e
-  c8 --check-coverage --lines "$THRESHOLD" --functions "$THRESHOLD" --branches "$THRESHOLD" \
-    node --test 2>&1 | tee "$TMPLOG"
+  if echo "$TEST_SCRIPT" | grep -qE 'jest|vitest|mocha|jasmine'; then
+    c8 --check-coverage --lines "$THRESHOLD" --functions "$THRESHOLD" --branches "$THRESHOLD" \
+      npm test 2>&1 | tee "$TMPLOG"
+  else
+    c8 --check-coverage --lines "$THRESHOLD" --functions "$THRESHOLD" --branches "$THRESHOLD" \
+      node --test 2>&1 | tee "$TMPLOG"
+  fi
   C8_EXIT=${PIPESTATUS[0]}
   set -e
   if [ "$C8_EXIT" -ne 0 ]; then
@@ -151,7 +167,9 @@ else
       [ "$TAP_COUNT" -eq 0 ] && { printf 'package.json:0\ttest suite failed — fix failing tests before proceeding\n'; ISSUES=$((ISSUES+1)); }
     fi
     # Parse coverage summary from output.
-    ALL_LINE=$(grep -iE "^all files" "$TMPLOG" | tail -1 || true)
+    # Node v22+ prefixes coverage lines with "ℹ " (U+2139 + space); drop the anchor
+    # so both "all files | 92.09 | ..." and "ℹ all files | 92.09 | ..." are matched.
+    ALL_LINE=$(grep -iaE "(^|[[:space:]])all files" "$TMPLOG" | tail -1 || true)
     if [ -n "$ALL_LINE" ]; then
       COV_PCT=$(echo "$ALL_LINE" | grep -oE '[0-9]+\.[0-9]+' | head -1)
       if [ -n "$COV_PCT" ]; then
@@ -184,22 +202,24 @@ else
       done < "$TMPLOG"
       [ "$TAP_COUNT" -eq 0 ] && { printf 'package.json:0\ttest suite failed — fix failing tests before proceeding\n'; ISSUES=$((ISSUES+1)); }
     fi
-    printf 'package.json:0\tJS coverage threshold enforcement requires c8 (npm install -g c8) or Node.js v22+\n'
-    ISSUES=$((ISSUES+1))
+    printf 'WARN: package.json:0\tJS coverage threshold enforcement requires c8 (npm install -g c8) or Node.js v22+\n'
+    # Do not increment ISSUES — missing tool is an env limitation, not a code defect
   fi
 fi
 rm -f "$TMPLOG"
 cd "$ROOT"
 
 # Assertion density check
+# -a flag forces text mode on macOS BSD grep so files containing multi-byte UTF-8
+# chars (e.g. U+2192 → or U+2500 ─) are not misclassified as binary and skipped.
 while IFS= read -r f; do
   if [ -z "$f" ]; then continue; fi
-  if ! grep -qE "assert\.|expect\(|should\.|t\.pass|t\.fail|ok\(" "$f" 2>/dev/null; then
+  if ! grep -qaE "assert[.(]|expect\(|should\.|t\.pass|t\.fail|(^|[^a-zA-Z])ok\(" "$f" 2>/dev/null; then
     rel="${f#$ROOT/}"
     printf '%s:0\ttest file has no assertion calls\n' "$rel"
     ISSUES=$((ISSUES+1))
   fi
-done < <(find "$ROOT" -maxdepth 5 \( -name "*.test.js" -o -name "*.spec.js" \) -not -path "*/node_modules/*" 2>/dev/null || true)
+done < <(find "$ROOT" -maxdepth 8 \( -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \) -not -path "*/node_modules/*" 2>/dev/null || true)
 
 # Live credential check in JS tests
 while IFS= read -r f; do
@@ -210,8 +230,9 @@ while IFS= read -r f; do
     rel="${f#$ROOT/}"
     printf '%s:%s\tlive credential env var read in test\n' "$rel" "$lineno"
     ISSUES=$((ISSUES+1))
-  done < <(grep -nE "process\.env\.(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API|ADMIN)[^_A-Z]" "$f" 2>/dev/null || true)
-done < <(find "$ROOT" -maxdepth 5 \( -name "*.test.js" -o -name "*.spec.js" \) -not -path "*/node_modules/*" 2>/dev/null || true)
+  done < <({ grep -nE "process\.env\.([A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_]*|API_[A-Z0-9_]+|ADMIN_[A-Z0-9_]+)" "$f"; \
+             grep -nE "process\.env\[|const[[:space:]]*\{[^}]*(KEY|TOKEN|SECRET|PASSWORD)" "$f"; } 2>/dev/null | sort -t: -k1,1n || true)
+done < <(find "$ROOT" -maxdepth 8 \( -name "*.test.js" -o -name "*.spec.js" -o -name "*.test.ts" -o -name "*.spec.ts" \) -not -path "*/node_modules/*" 2>/dev/null || true)
 
 SUMMARY_EMITTED=1
 if [ "$ISSUES" -eq 0 ]; then

@@ -28,14 +28,20 @@ fi
 
 # --- CHECK 1: Symbol references ---
 # Extract exported Go symbols and verify each appears in docs.
-if find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*" 2>/dev/null | grep -q .; then
+# ISSUE 6: exclude generated files (*.pb.go, zz_generated.*.go, mock_*.go) and vendor/
+# Use -print -quit with variable capture instead of `find | grep -q .` to avoid the
+# pipefail+SIGPIPE bug: grep exits early on first match, find gets SIGPIPE (141),
+# pipefail surfaces it, and the entire block is silently skipped.
+GO_FILES_PROBE=$(find . -name "*.go" -not -name "*_test.go" -not -name "*.pb.go" -not -name "zz_generated.*.go" -not -name "mock_*.go" -not -path "./.git/*" -not -path '*/vendor/*' -print -quit 2>/dev/null || true)
+if [ -n "$GO_FILES_PROBE" ]; then
   # Collect all doc files into a temp file for efficient multi-symbol lookup.
   DOCS_TMP=$(mktemp)
   # shellcheck disable=SC2064  # intentional: capture DOCS_TMP at trap registration time
   trap "_ec=\$?; rm -f '$DOCS_TMP'; if [ \"\$SUMMARY_EMITTED\" -eq 0 ]; then printf 'GATE_CRASH:0\tgate crashed (exit %s)\n' \"\$_ec\"; echo 'FAIL (1 issues)'; fi" EXIT
+  # ISSUE 10: scan all .md files (not just README + ./docs/) to cover ./doc/, other locations
   {
-    cat README.md 2>/dev/null || true
-    find ./docs -name '*.md' 2>/dev/null | while IFS= read -r mdf; do
+    find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' 2>/dev/null \
+      | while IFS= read -r mdf; do
       cat "$mdf" 2>/dev/null || true
     done
   } > "$DOCS_TMP"
@@ -43,17 +49,20 @@ if find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*" 2>/dev/null 
   while IFS=: read -r gofile lineno symline; do
     sym=$(echo "$symline" | grep -oE '^func [A-Z][A-Za-z0-9_]+|^type [A-Z][A-Za-z0-9_]+' | awk '{print $2}' | head -1)
     [ -z "$sym" ] && continue
-    if ! grep -q "$sym" "$DOCS_TMP" 2>/dev/null; then
+    # ISSUE 5: use word-boundary anchors to avoid false passes on common English substrings
+    if ! grep -qE "(^|[^A-Za-z0-9_])${sym}([^A-Za-z0-9_]|$)" "$DOCS_TMP" 2>/dev/null; then
       printf '%s:%s\texported symbol "%s" not referenced in any documentation\n' "$gofile" "$lineno" "$sym"
       ISSUES=$((ISSUES+1))
     fi
-  done < <(grep -rn --include="*.go" -E '^func [A-Z]|^type [A-Z]' . 2>/dev/null \
-    | grep -v '_test.go' | grep -v '.git' | head -100 || true)
+  # ISSUE 1 & 6: --exclude-dir=vendor and --exclude generated files; ISSUE 9: no head -100 cap
+  done < <(grep -rn --include="*.go" --exclude='*.pb.go' --exclude='zz_generated.*.go' --exclude='mock_*.go' --exclude-dir=vendor -E '^func [A-Z]|^type [A-Z]' . 2>/dev/null \
+    | grep -v '_test.go' | grep -v '.git' || true)
 fi
 
 # --- CHECK 2: Signature drift ---
 # For each exported Go function, check if docs contain a divergent signature.
-if find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*" 2>/dev/null | grep -q .; then
+# ISSUE 6: exclude generated files and vendor/
+if [ -n "$GO_FILES_PROBE" ]; then
   while IFS=: read -r gofile lineno sigline; do
     # Extract function name and params from source signature.
     funcname=$(echo "$sigline" | grep -oE 'func [A-Z][A-Za-z0-9_]+\(' | head -1 | sed 's/func //;s/($//')
@@ -70,8 +79,9 @@ if find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*" 2>/dev/null 
         ISSUES=$((ISSUES+1))
       fi
     fi
-  done < <(grep -rn --include="*.go" -E '^func [A-Z]' . 2>/dev/null \
-    | grep -v '_test.go' | grep -v '.git' | head -100 || true)
+  # ISSUE 1 & 6: --exclude-dir=vendor and --exclude generated files; ISSUE 9: no head -100 cap
+  done < <(grep -rn --include="*.go" --exclude='*.pb.go' --exclude='zz_generated.*.go' --exclude='mock_*.go' --exclude-dir=vendor -E '^func [A-Z]' . 2>/dev/null \
+    | grep -v '_test.go' | grep -v '.git' || true)
 fi
 
 # --- CHECK 2b: JS exported-symbol coverage — analog of Go exported func/type check ---
@@ -81,6 +91,7 @@ fi
 #        globs (e.g. ["src/index.js","src/api.js"]).  If neither is configured the check
 #        is skipped — scanning every export without an explicit public-API boundary
 #        produces false positives for internal helpers and erodes gate trust.
+DOC_TMP=""
 if [ ! -f go.mod ]; then
   JS_SRC=""
   for d in src lib sdk/src; do
@@ -99,7 +110,8 @@ if [ ! -f go.mod ]; then
     # Only run the check when the project has explicitly declared its public surface.
     if [ -n "$JS_PUBLIC_SYMBOLS" ] || [ -n "$JS_PUBLIC_FILES" ]; then
       DOC_TMP=$(mktemp)
-      find "$ROOT" -maxdepth 3 -name "*.md" ! -path "*/node_modules/*" ! -path "*/.git/*" \
+      # ISSUE 14: remove -maxdepth 3 to avoid missing docs at depth 4+; also exclude vendor/
+      find "$ROOT" -name "*.md" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" \
         -exec cat {} \; > "$DOC_TMP" 2>/dev/null
 
       if [ -n "$JS_PUBLIC_SYMBOLS" ]; then
@@ -125,10 +137,28 @@ if [ ! -f go.mod ]; then
               printf '%s:0\tJS exported symbol %s (from public API file %s) not found in any documentation file\n' "$JS_SRC" "$jssym" "$api_file"
               ISSUES=$((ISSUES+1))
             fi
-          done < <(grep -h "^export " "$full_path" 2>/dev/null \
-            | sed "s/export async /export /" | sed "s/export //" \
-            | grep -oE "^(function|class|const|let) [A-Za-z][A-Za-z0-9_]*" \
-            | awk '{print $2}' | sort -u || true)
+          done < <(
+            # Capture: export function/class/const/let Foo, export async function Foo,
+            # and ESM re-exports: export { Foo, Bar } from '...' or export { Foo as default } from '...'
+            {
+              # ISSUE 11: extend alternation to cover TypeScript-specific export forms
+              # (abstract class, type, interface, enum, var) in addition to function/class/const/let
+              grep -h "^export " "$full_path" 2>/dev/null \
+                | sed "s/export async /export /" \
+                | grep -oE "^export (abstract class|function|class|const|let|var|type|interface|enum) [A-Za-z][A-Za-z0-9_]*" \
+                | awk '{print $NF}'
+              # Named re-exports: extract identifiers from export { Foo, Bar as Baz } from '...'
+              # ISSUE 2: strip braces, split on comma, strip "as Alias" suffixes to avoid
+              #          bogus concatenated symbols like "BarasBaz"; also drop leading '{' artifact
+              grep -hE "^export[[:space:]]*\{[^}]+\}" "$full_path" 2>/dev/null \
+                | grep -oE "\{[^}]+\}" \
+                | tr -d '{}' \
+                | tr ',' '\n' \
+                | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]][Aa][Ss][[:space:]][A-Za-z][A-Za-z0-9_]*//' \
+                | grep -oE '^[A-Za-z][A-Za-z0-9_]+' \
+                | grep -v '^default$'
+            } | sort -u || true
+          )
         done <<< "$JS_PUBLIC_FILES"
       fi
 
@@ -170,10 +200,12 @@ while IFS= read -r mdfile; do
       printf '%s:0\tdead link: "%s" does not exist\n' "$mdfile" "$link"
       ISSUES=$((ISSUES+1))
     fi
+  # ISSUE 3 & 13: add grep -v '^//' to filter protocol-relative URLs (e.g. //cdn.example.com/…)
   done < <(_extract_md_links "$mdfile" \
-    | grep -v '^https\?://' | grep -v '^http://' | grep -v '^mailto:' | grep -v '^#' || true)
-done < <({ find . -maxdepth 1 -name "README.md" 2>/dev/null; find ./docs -name '*.md' 2>/dev/null; } \
-  | grep -v './.git/' | grep -v '/node_modules/' | grep -v '/vendor/' | sort -u || true)
+    | grep -v '^https\?://' | grep -v '^http://' | grep -v '^mailto:' | grep -v '^#' | grep -v '^//' || true)
+# ISSUE 12: scan all .md files, not just README.md + ./docs/*.md
+done < <(find . -name '*.md' -not -path './.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' 2>/dev/null \
+  | sort -u || true)
 
 # --- CHECK 4: CHANGELOG gaps ---
 # If git is available, detect commits since last release tag not reflected in CHANGELOG.
@@ -182,10 +214,8 @@ if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
   if [ -n "$last_tag" ] && [ -f CHANGELOG.md ]; then
     commit_count=$(git log "${last_tag}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
     if [ "$commit_count" -gt 0 ]; then
-      # Check if CHANGELOG was modified more recently than the last tag commit.
-      tag_ts=$(git log -1 --format="%ct" "$last_tag" 2>/dev/null || echo "0")
-      changelog_ts=$(git log -1 --format="%ct" -- CHANGELOG.md 2>/dev/null || echo "0")
-      if [ "$changelog_ts" -le "$tag_ts" ]; then
+      # Check if CHANGELOG.md was updated in any commit since the last tag.
+      if ! git log "${last_tag}..HEAD" --oneline -- CHANGELOG.md 2>/dev/null | { grep -q . || true; }; then
         printf 'CHANGELOG.md:0\t%s unreleased commit(s) since tag "%s" not reflected in CHANGELOG.md\n' \
           "$commit_count" "$last_tag"
         ISSUES=$((ISSUES+1))
@@ -211,9 +241,9 @@ if [ -f .karen.json ]; then
     [ -n "$ANN_VAL" ] && ANNOTATION="$ANN_VAL"
     # Files glob extraction via awk (simple line-by-line scan of the files array).
     DOCTEST_FILES=$(awk '
-      /\"files\"/ { in_files=1; next }
+      /"files"/ { in_files=1; next }
       in_files && /\]/ { in_files=0; next }
-      in_files && /\"[^"]+\"/ { match($0, /"([^"]+)"/, a); print a[1] }
+      in_files && match($0, /"[^"]+"/) { val=substr($0, RSTART+1, RLENGTH-2); print val }
     ' .karen.json 2>/dev/null || true)
   fi
 fi
@@ -221,8 +251,9 @@ fi
 if [ -n "$DOCTEST_FILES" ]; then
   TMPDIR_DOCTEST=$(mktemp -d)
   # shellcheck disable=SC2064  # intentional: capture paths at trap registration time
-  trap "_ec=\$?; rm -rf '$TMPDIR_DOCTEST'; rm -f '${DOCS_TMP:-}'; if [ \"\$SUMMARY_EMITTED\" -eq 0 ]; then printf 'GATE_CRASH:0\tgate crashed (exit %s)\n' \"\$_ec\"; echo 'FAIL (1 issues)'; fi" EXIT
+  trap "_ec=\$?; rm -rf '$TMPDIR_DOCTEST'; rm -f '${DOCS_TMP:-}'; rm -f '${DOC_TMP:-}'; if [ \"\$SUMMARY_EMITTED\" -eq 0 ]; then printf 'GATE_CRASH:0\tgate crashed (exit %s)\n' \"\$_ec\"; echo 'FAIL (1 issues)'; fi" EXIT
 
+  ann_escaped=$(printf '%s' "$ANNOTATION" | sed 's/[].\*^$[{(|+?]/\\&/g')
   while IFS= read -r glob_pattern; do
     [ -z "$glob_pattern" ] && continue
     # Expand the glob relative to ROOT.
@@ -239,16 +270,18 @@ if [ -n "$DOCTEST_FILES" ]; then
         lineno=$((lineno+1))
         if [ "$in_block" -eq 0 ]; then
           # Check for opening fence with annotation.
-          if echo "$rawline" | grep -qE '^\`\`\`[a-zA-Z].*'"$ANNOTATION"; then
+          # ISSUE 15: support tilde fences (~~~) and extended backtick fences (````+)
+          if echo "$rawline" | grep -qE '^(`{3,}|~{3,})[a-zA-Z].*'"$ann_escaped"; then
             in_block=1
-            lang_id=$(echo "$rawline" | sed 's/^```//' | awk '{print $1}')
+            lang_id=$(echo "$rawline" | sed 's/^[`~]*//' | awk '{print $1}')
             block_lines=""
             block_start_line=$lineno
             block_num=$((block_num+1))
           fi
         else
           # Check for closing fence.
-          if echo "$rawline" | grep -qE '^\`\`\`[[:space:]]*$'; then
+          # ISSUE 15: support tilde fences and extended backtick fences for closing too
+          if echo "$rawline" | grep -qE '^(`{3,}|~{3,})[[:space:]]*$'; then
             in_block=0
             # Determine runtime from lang_id.
             runtime=""
@@ -268,8 +301,9 @@ if [ -n "$DOCTEST_FILES" ]; then
               esac
               block_file="$TMPDIR_DOCTEST/block_${block_num}.${ext}"
               printf '%s\n' "$block_lines" > "$block_file"
-              if ! "$runtime" "$block_file" >/dev/null 2>&1; then
-                exit_code=$?
+              "$runtime" "$block_file" >/dev/null 2>&1
+              exit_code=$?
+              if [ "$exit_code" -ne 0 ]; then
                 printf '%s:%s\texample tagged %s failed with exit %s\n' \
                   "$docfile" "$block_start_line" "$ANNOTATION" "$exit_code"
                 ISSUES=$((ISSUES+1))
@@ -285,7 +319,7 @@ $rawline"
           fi
         fi
       done < "$docfile"
-    done < <(find . -path "./.git/*" -prune -o -name "${glob_pattern##*/}" -print 2>/dev/null \
+    done < <(find . -path "./.git/*" -prune -o -path "./${glob_pattern}" -print 2>/dev/null \
       | grep -v '.git' || true)
   done <<< "$DOCTEST_FILES"
 fi
